@@ -128,7 +128,9 @@ class TestIconGeneration:
 
     def test_ico_header_magic(self) -> None:
         from build import _make_ico
-        out = Path(tempfile.mkstemp(suffix=".ico"))
+        fd, path = tempfile.mkstemp(suffix=".ico")
+        import os; os.close(fd)
+        out = Path(path)
         _make_ico(out)
         data = out.read_bytes()
         # ICO magic: reserved=0, type=1 (icon)
@@ -142,7 +144,9 @@ class TestIconGeneration:
         """Each embedded image must be a BMP (BITMAPINFOHEADER, biSize=40)."""
         import struct
         from build import _make_ico
-        out = Path(tempfile.mkstemp(suffix=".ico"))
+        fd, path = tempfile.mkstemp(suffix=".ico")
+        import os; os.close(fd)
+        out = Path(path)
         _make_ico(out)
         data = out.read_bytes()
         # Directory entry layout: B B B B H H I I (16 bytes each, starting at offset 6)
