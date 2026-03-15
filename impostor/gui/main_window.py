@@ -759,14 +759,12 @@ class MainWindow(TooltipMixin):
         action_card.pack(fill="x", padx=12, pady=(4, 0))
 
         self._progress = ttk.Progressbar(action_card, mode="indeterminate")
-        self._progress.pack(fill="x", padx=16, pady=(10, 4))
-        self._progress.stop()
 
         self._run_btn = StyledButton(
             action_card, text="▶  Imposer le PDF", command=self._run,
         )
-        self._run_btn.config(font=("Segoe UI Semibold", 12), pady=10)
-        self._run_btn.pack(fill="x", padx=16, pady=(0, 10))
+        self._run_btn.config(font=("Segoe UI Semibold", 14), pady=14)
+        self._run_btn.pack(fill="x", padx=16, pady=(10, 10))
 
         # ── Status bar ─────────────────────────────────────────────────────
         self._status_var = tk.StringVar(value="Prêt.")
@@ -811,6 +809,7 @@ class MainWindow(TooltipMixin):
         if self._running:
             self._running = False
             self._progress.stop()
+            self._progress.pack_forget()
             self._run_btn.config(state="normal", text="▶  Imposer le PDF")
             self._status("Annulé.")
 
@@ -934,6 +933,7 @@ class MainWindow(TooltipMixin):
 
         self._running = True
         self._run_btn.config(state="disabled", text="⏳  Traitement en cours…")
+        self._progress.pack(fill="x", padx=16, pady=(0, 6), before=self._run_btn)
         self._progress.start(10)
         self._status("Imposition en cours…")
 
@@ -946,6 +946,7 @@ class MainWindow(TooltipMixin):
     def _on_done(self, result) -> None:
         self._running = False
         self._progress.stop()
+        self._progress.pack_forget()
         self._run_btn.config(state="normal", text="▶  Imposer le PDF")
 
         if result.success:
