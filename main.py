@@ -5,16 +5,17 @@ Run with:   python main.py
 Build with: python build.py
 """
 
-import sys
 import argparse
+import sys
+from pathlib import Path
+
+from impostor.core.imposition import DuplexMode, ImpositionSettings, impose
+from impostor.gui.main_window import MainWindow
+from impostor.utils.logging_setup import setup_logging
 
 
 def _cli_mode(args: argparse.Namespace) -> int:
     """Headless CLI mode for batch/scripting use."""
-    from pathlib import Path
-    from impostor.core.imposition import DuplexMode, ImpositionSettings, impose
-    from impostor.utils.logging_setup import setup_logging
-
     setup_logging(debug=args.debug)
 
     try:
@@ -41,9 +42,6 @@ def _cli_mode(args: argparse.Namespace) -> int:
 
 
 def _gui_mode() -> None:
-    from impostor.utils.logging_setup import setup_logging
-    from impostor.gui.main_window import MainWindow
-
     setup_logging(debug=False)
     app = MainWindow()
     app.run()

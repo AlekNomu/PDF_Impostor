@@ -4,15 +4,21 @@ Regression tests — each test here documents a bug that was found and fixed.
 
 from __future__ import annotations
 
+import os
+import struct
 import tempfile
 from pathlib import Path
 
 import pypdf
+import pytest
 
+from build import _make_ico
 from impostor.core.imposition import (
     DuplexMode,
     ImpositionSettings,
     _build_print_sequence,
+    _horizontal_translations,
+    _iter_sides,
     impose,
 )
 
@@ -118,6 +124,182 @@ class TestFrontBackPagePlacementRegression:
         assert seq[2] == 22 and seq[3] == 1
 
 
+class TestCreepDirectionRegression:
+    """
+    Regression: creep compensation was applied in the wrong direction. Inner
+    sheets were shifted *away* from the spine (+creep on the right half, -creep
+    on the left half), which adds to the physical push-out instead of cancelling
+    it — on a 25-sheet booklet the innermost pages drifted further into the
+    fore-edge trim area the higher the setting was.
+
+    Correct behaviour: once folded, inner sheets protrude at the fore-edge and
+    lose more paper when trimmed flush, so their content must move *toward the
+    spine* — left for the right-half page, right for the left-half page.
+
+    Fixed by: _horizontal_translations() subtracting creep on the right half and
+    adding it on the left half.
+    """
+
+    ORIG_W = 595.0  # A4 portrait width in points
+
+    def test_outermost_sheet_has_no_creep(self) -> None:
+        """Sheet 0 is the outermost: creep must not move it at all."""
+        right_tx, left_tx = _horizontal_translations(
+            self.ORIG_W, 0, inside_offset=0.0,
+            creep_compensation=2.0, center_adjustment=0.0,
+        )
+        assert right_tx == self.ORIG_W
+        assert left_tx == 0.0
+
+    def test_inner_sheets_move_toward_the_spine(self) -> None:
+        """
+        The spine sits at x = ORIG_W. The right-half page must move left
+        (decreasing x) and the left-half page right (increasing x) as sheets
+        get deeper into the signature.
+        """
+        creep = 2.0
+        previous_right = None
+        previous_left = None
+        for sheet_num in range(5):
+            right_tx, left_tx = _horizontal_translations(
+                self.ORIG_W, sheet_num, inside_offset=0.0,
+                creep_compensation=creep, center_adjustment=0.0,
+            )
+            # Distance from the spine shrinks on both halves
+            assert right_tx == self.ORIG_W - creep * sheet_num
+            assert left_tx == creep * sheet_num
+            if previous_right is not None:
+                assert right_tx < previous_right, "right half must move toward the spine"
+                assert left_tx > previous_left, "left half must move toward the spine"
+            previous_right, previous_left = right_tx, left_tx
+
+    def test_creep_is_symmetric_around_the_spine(self) -> None:
+        """Both halves must close in on the spine by the same amount."""
+        for sheet_num in range(1, 6):
+            right_tx, left_tx = _horizontal_translations(
+                self.ORIG_W, sheet_num, inside_offset=0.0,
+                creep_compensation=1.5, center_adjustment=0.0,
+            )
+            right_gap = self.ORIG_W - right_tx   # right half shifted left by this
+            left_gap = left_tx                   # left half shifted right by this
+            assert right_gap == left_gap
+
+    def test_zero_creep_is_a_noop(self) -> None:
+        """With creep disabled, sheet depth must not change anything."""
+        for sheet_num in range(5):
+            right_tx, left_tx = _horizontal_translations(
+                self.ORIG_W, sheet_num, inside_offset=10.0,
+                creep_compensation=0.0, center_adjustment=3.0,
+            )
+            assert right_tx == self.ORIG_W + 10.0 + 3.0
+            assert left_tx == -10.0 + 3.0
+
+
+class TestCreepSheetDepthRegression:
+    """
+    Regression: impose() derived the sheet depth used for creep with
+    `sheet_num_in_sig = (i // 2) % sps`, where `i` walks the flat page sequence.
+    That index counts *printed sides*, not sheets, so it was wrong twice over:
+
+      * recto and verso of the same physical sheet got different creep values,
+        even though they are the two faces of one piece of paper;
+      * `% sps` wrapped after `sps` sides — i.e. halfway through the booklet —
+        resetting creep to 0. On a 25-sheet booklet printed in AUTO_DUPLEX the
+        compensation visibly restarted from zero around the middle.
+
+    Correct behaviour: depth is a property of the physical sheet (0 = outermost),
+    shared by both of its faces, restarting only on a new signature.
+
+    Fixed by: _iter_sides() emitting the depth alongside each side, so impose()
+    no longer recomputes it from the flat sequence index.
+    """
+
+    def test_both_faces_of_a_sheet_share_one_depth(self) -> None:
+        """AUTO_DUPLEX emits front then back of each sheet: depths pair up."""
+        sides = _iter_sides(100, 25, DuplexMode.AUTO_DUPLEX)
+        depths = [depth for _r, _l, depth in sides]
+        assert len(depths) == 50  # 25 sheets x 2 faces
+        for sheet in range(25):
+            front, back = depths[2 * sheet], depths[2 * sheet + 1]
+            assert front == back == sheet, (
+                f"sheet {sheet}: faces got depths {front}/{back}"
+            )
+
+    def test_depth_never_resets_mid_booklet(self) -> None:
+        """The 25-sheet booklet that exposed the bug: depth rises 0→24 once."""
+        sides = _iter_sides(100, 25, DuplexMode.AUTO_DUPLEX)
+        depths = [depth for _r, _l, depth in sides]
+        # Deduplicate consecutive repeats (each sheet appears twice in a row)
+        per_sheet = depths[::2]
+        assert per_sheet == list(range(25))
+        assert max(depths) == 24, "innermost sheet must reach full creep"
+
+    @pytest.mark.parametrize("mode", list(DuplexMode))
+    def test_depth_stays_within_signature_bounds(self, mode: DuplexMode) -> None:
+        """Whatever the duplex mode, depth is always in [0, sps-1]."""
+        sps = 6
+        sides = _iter_sides(4 * sps * 3, sps, mode)  # 3 signatures
+        depths = [depth for _r, _l, depth in sides]
+        assert min(depths) == 0
+        assert max(depths) == sps - 1
+        # Each depth occurs exactly twice per signature (recto + verso)
+        for depth in range(sps):
+            assert depths.count(depth) == 2 * 3
+
+    @pytest.mark.parametrize("mode", list(DuplexMode))
+    def test_every_sheet_is_emitted_once_per_face(self, mode: DuplexMode) -> None:
+        """Sanity: side count always equals 2 x total sheets."""
+        for sps, num_sigs in [(1, 1), (2, 3), (25, 1), (6, 4)]:
+            sides = _iter_sides(4 * sps * num_sigs, sps, mode)
+            assert len(sides) == 2 * sps * num_sigs
+
+
+class TestInsideOffsetSymmetryRegression:
+    """
+    Regression: inside_offset was only applied to the page on the right half of
+    the sheet, so asking for a binding margin shifted one page of the spread and
+    left the other in place — the two pages of a spread ended up misaligned
+    instead of both gaining gutter.
+
+    Correct behaviour: inside_offset is a binding margin, so it must push both
+    halves *away* from the spine by the same amount.
+
+    Fixed by: _horizontal_translations() subtracting inside_offset on the left
+    half, mirroring the addition on the right half.
+    """
+
+    ORIG_W = 595.0
+
+    def test_both_halves_move_away_from_the_spine(self) -> None:
+        offset = 12.0
+        right_tx, left_tx = _horizontal_translations(
+            self.ORIG_W, 0, inside_offset=offset,
+            creep_compensation=0.0, center_adjustment=0.0,
+        )
+        # Spine is at x = ORIG_W: right half moves right, left half moves left.
+        assert right_tx == self.ORIG_W + offset
+        assert left_tx == -offset
+
+    def test_gutter_is_symmetric(self) -> None:
+        """Both halves must gain the same gutter, whatever the offset."""
+        for offset in (0.0, 5.0, 20.0, 50.0):
+            right_tx, left_tx = _horizontal_translations(
+                self.ORIG_W, 0, inside_offset=offset,
+                creep_compensation=0.0, center_adjustment=0.0,
+            )
+            assert (right_tx - self.ORIG_W) == offset
+            assert -left_tx == offset
+
+    def test_center_adjustment_shifts_both_halves_the_same_way(self) -> None:
+        """Printer centring is a whole-sheet shift, not a symmetric one."""
+        right_tx, left_tx = _horizontal_translations(
+            self.ORIG_W, 0, inside_offset=0.0,
+            creep_compensation=0.0, center_adjustment=7.0,
+        )
+        assert right_tx == self.ORIG_W + 7.0
+        assert left_tx == 7.0
+
+
 class TestIconGeneration:
     """
     Regression: build.py must generate a valid multi-size BMP-in-ICO without
@@ -127,9 +309,8 @@ class TestIconGeneration:
     """
 
     def test_ico_header_magic(self) -> None:
-        from build import _make_ico
         fd, path = tempfile.mkstemp(suffix=".ico")
-        import os; os.close(fd)
+        os.close(fd)
         out = Path(path)
         _make_ico(out)
         data = out.read_bytes()
@@ -142,10 +323,8 @@ class TestIconGeneration:
 
     def test_ico_images_are_bmp(self) -> None:
         """Each embedded image must be a BMP (BITMAPINFOHEADER, biSize=40)."""
-        import struct
-        from build import _make_ico
         fd, path = tempfile.mkstemp(suffix=".ico")
-        import os; os.close(fd)
+        os.close(fd)
         out = Path(path)
         _make_ico(out)
         data = out.read_bytes()

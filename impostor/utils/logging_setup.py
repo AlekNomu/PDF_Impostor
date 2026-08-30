@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -14,7 +15,6 @@ def setup_logging(debug: bool = False) -> None:
 
     # Also write to a log file in temp dir
     try:
-        import tempfile
         log_path = Path(tempfile.gettempdir()) / "pdf_impostor.log"
         handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
     except Exception:

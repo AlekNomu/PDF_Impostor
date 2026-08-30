@@ -15,7 +15,10 @@ Architecture:
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
+import sys
 import threading
 import tkinter as tk
 import tkinter.filedialog as fd
@@ -24,10 +27,22 @@ import tkinter.ttk as ttk
 from pathlib import Path
 from typing import Optional
 
+import pypdf
+
 from impostor.core.imposition import (
-    DuplexMode, ImpositionSettings, _pad_page_count, detect_page_orientations, impose,
+    DuplexMode,
+    ImpositionSettings,
+    _pad_page_count,
+    detect_page_orientations,
+    impose,
 )
-from impostor.utils.config import AppConfig, _PROFILE_KEYS, add_recent_file
+from impostor.gui.preview import ImpositionPreview
+from impostor.utils.config import _PROFILE_KEYS, AppConfig, add_recent_file
+
+try:
+    from tkinterdnd2 import TkinterDnD  # type: ignore[import-untyped]
+except Exception:
+    TkinterDnD = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +62,38 @@ COLORS = {
     "error":        "#E76F51",   # erreurs
     "border":       "#3A3A3A",   # séparateurs et contours
 }
+
+# ── Constantes métier / configuration ──────────────────────────────────────────
+PAGES_PER_SHEET = 4  # une feuille recto-verso 2-up porte 4 pages
+
+WINDOW_MIN_WIDTH = 640
+WINDOW_MIN_HEIGHT = 580
+
+PROGRESS_BAR_INTERVAL_MS = 10
+
+TOOLTIP_OFFSET_X = 20
+TOOLTIP_OFFSET_Y = 4
+
+SPS_SLIDER_MIN = 0
+SPS_SLIDER_MAX = 20
+SPS_SLIDER_STEP = 1
+
+ZOOM_MIN = 0.5
+ZOOM_MAX = 1.0
+ZOOM_STEP = 0.01
+ZOOM_DEFAULT = 1.0
+
+INSIDE_OFFSET_MIN = -50
+INSIDE_OFFSET_MAX = 50
+INSIDE_OFFSET_STEP = 1.0
+
+CREEP_COMPENSATION_MIN = 0
+CREEP_COMPENSATION_MAX = 10
+CREEP_COMPENSATION_STEP = 0.5
+
+CENTER_ADJUSTMENT_MIN = -20
+CENTER_ADJUSTMENT_MAX = 20
+CENTER_ADJUSTMENT_STEP = 0.5
 
 DUPLEX_OPTIONS = [
     ("Auto recto-verso",      DuplexMode.AUTO_DUPLEX),
@@ -123,31 +170,30 @@ OPTIONS AVANCÉES
 class TooltipMixin:
     """Simple tooltip support for any widget."""
 
+    _tooltip_windows: dict[int, tk.Toplevel] = {}
+
     def add_tooltip(self, widget: tk.Widget, text: str) -> None:
-        tip: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", functools.partial(self._show_tooltip, widget, text), add=True)
+        widget.bind("<Leave>", functools.partial(self._hide_tooltip, widget), add=True)
 
-        def show(event: tk.Event) -> None:
-            nonlocal tip
-            x = widget.winfo_rootx() + 20
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
-            tip = tk.Toplevel(widget)
-            tip.wm_overrideredirect(True)
-            tip.wm_geometry(f"+{x}+{y}")
-            lbl = tk.Label(
-                tip, text=text, background=COLORS["surface"], foreground=COLORS["text"],
-                relief="solid", borderwidth=1, font=("Segoe UI", 9),
-                padx=8, pady=4, wraplength=300,
-            )
-            lbl.pack()
+    def _show_tooltip(self, widget: tk.Widget, text: str, _event: tk.Event) -> None:
+        x = widget.winfo_rootx() + TOOLTIP_OFFSET_X
+        y = widget.winfo_rooty() + widget.winfo_height() + TOOLTIP_OFFSET_Y
+        tip = tk.Toplevel(widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(
+            tip, text=text, background=COLORS["surface"], foreground=COLORS["text"],
+            relief="solid", borderwidth=1, font=("Segoe UI", 9),
+            padx=8, pady=4, wraplength=300,
+        )
+        lbl.pack()
+        self._tooltip_windows[id(widget)] = tip
 
-        def hide(_event: tk.Event) -> None:
-            nonlocal tip
-            if tip:
-                tip.destroy()
-                tip = None
-
-        widget.bind("<Enter>", show, add=True)
-        widget.bind("<Leave>", hide, add=True)
+    def _hide_tooltip(self, widget: tk.Widget, _event: tk.Event) -> None:
+        tip = self._tooltip_windows.pop(id(widget), None)
+        if tip is not None:
+            tip.destroy()
 
 
 class StyledButton(tk.Button):
@@ -388,7 +434,7 @@ class SignatureFrame(Card, TooltipMixin):
         lbl.grid(row=1, column=0, sticky="w", padx=16, pady=4)
         self.add_tooltip(lbl, "0 = Magazine (toutes les feuilles forment un seul cahier)")
 
-        _make_scale(self, self._sps_var, 0, 20, 1).grid(
+        _make_scale(self, self._sps_var, SPS_SLIDER_MIN, SPS_SLIDER_MAX, SPS_SLIDER_STEP).grid(
             row=1, column=1, sticky="ew", padx=8, pady=4)
 
         self._value_lbl = tk.Label(
@@ -418,10 +464,16 @@ class SignatureFrame(Card, TooltipMixin):
             desc = "Toutes les feuilles forment une seule grande signature – idéal pour les magazines et petits livrets."
         elif v == 1:
             label = "1 feuille"
-            desc = "Chaque signature = 1 feuille pliée = 4 pages. Bon pour tester, mais peu pratique pour les agendas."
+            desc = (
+                f"Chaque signature = 1 feuille pliée = {PAGES_PER_SHEET} pages. "
+                "Bon pour tester, mais peu pratique pour les agendas."
+            )
         else:
             label = f"{v} feuilles"
-            desc = f"Chaque signature = {v} feuilles = {v * 4} pages. Pliez {v} feuilles ensemble, puis reliez les carnets."
+            desc = (
+                f"Chaque signature = {v} feuilles = {v * PAGES_PER_SHEET} pages. "
+                f"Pliez {v} feuilles ensemble, puis reliez les carnets."
+            )
         self._value_lbl.config(text=label)
         self._desc_lbl.config(text=desc)
 
@@ -495,13 +547,15 @@ class AdvancedFrame(Card, TooltipMixin):
     """Options avancées : zoom, décalage, creep, centrage."""
 
     _PARAMS = [
-        ("Zoom (%)",            "zoom",              0.5,  1.0, 0.01,
+        ("Zoom (%)",            "zoom",              ZOOM_MIN,  ZOOM_MAX, ZOOM_STEP,
          "Réduire les pages pour ajouter une marge d'impression."),
-        ("Décalage intérieur",  "inside_offset",    -50,   50,  1.0,
+        ("Décalage intérieur",  "inside_offset",    INSIDE_OFFSET_MIN, INSIDE_OFFSET_MAX, INSIDE_OFFSET_STEP,
          "Décalage supplémentaire vers la reliure (en points)."),
-        ("Compensation creep",  "creep_compensation", 0,   10,  0.5,
+        ("Compensation creep",  "creep_compensation", CREEP_COMPENSATION_MIN, CREEP_COMPENSATION_MAX,
+         CREEP_COMPENSATION_STEP,
          "Compense le glissement des pages intérieures lors du pliage."),
-        ("Centrage imprimante", "center_adjustment", -20,  20,  0.5,
+        ("Centrage imprimante", "center_adjustment", CENTER_ADJUSTMENT_MIN, CENTER_ADJUSTMENT_MAX,
+         CENTER_ADJUSTMENT_STEP,
          "Corrige le décalage horizontal de votre imprimante."),
     ]
 
@@ -512,8 +566,8 @@ class AdvancedFrame(Card, TooltipMixin):
             key: tk.DoubleVar(value=config.get(key, 0.0))
             for _, key, *_ in self._PARAMS
         }
-        # zoom default is 1.0, not 0.0
-        self._vars["zoom"].set(config.get("zoom", 1.0))
+        # zoom default is ZOOM_DEFAULT, not 0.0
+        self._vars["zoom"].set(config.get("zoom", ZOOM_DEFAULT))
         self._build()
 
     def _build(self) -> None:
@@ -649,7 +703,8 @@ class MainWindow(TooltipMixin):
         self._running = False
 
         try:
-            from tkinterdnd2 import TkinterDnD  # type: ignore[import-untyped]
+            if TkinterDnD is None:
+                raise ImportError("tkinterdnd2 not available")
             self._root = TkinterDnD.Tk()
             self._dnd_available = True
         except Exception:
@@ -657,7 +712,7 @@ class MainWindow(TooltipMixin):
             self._dnd_available = False
         self._root.title(f"{self.APP_TITLE}  v{self.VERSION}")
         self._root.resizable(True, True)
-        self._root.minsize(640, 580)
+        self._root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self._root.configure(background=COLORS["bg"])
 
         geo = self._config.get("window_geometry", "")
@@ -740,7 +795,6 @@ class MainWindow(TooltipMixin):
         self._profiles_frame.pack(**CARD_PAD)
 
         # ── Preview tab ────────────────────────────────────────────────────
-        from impostor.gui.preview import ImpositionPreview
         self._preview = ImpositionPreview(preview_tab)
         self._preview.pack(fill="both", expand=True)
 
@@ -856,7 +910,6 @@ class MainWindow(TooltipMixin):
         path = self._file_frame.input_path
         if path and Path(path).exists():
             try:
-                import pypdf
                 self._preview_page_count = len(pypdf.PdfReader(path).pages)
             except Exception:
                 self._preview_page_count = 0
@@ -899,7 +952,7 @@ class MainWindow(TooltipMixin):
         num_pages = getattr(self, "_preview_page_count", 0)
         sps = self._sig_frame.sheets_per_signature
         if num_pages > 0:
-            effective_sps = sps if sps > 0 else (-(num_pages // -4))  # ceil div
+            effective_sps = sps if sps > 0 else (-(num_pages // -PAGES_PER_SHEET))  # ceil div
             padded = _pad_page_count(num_pages, effective_sps)
             blanks = padded - num_pages
             if blanks > 0:
@@ -934,14 +987,14 @@ class MainWindow(TooltipMixin):
         self._running = True
         self._run_btn.config(state="disabled", text="⏳  Traitement en cours…")
         self._progress.pack(fill="x", padx=16, pady=(0, 6), before=self._run_btn)
-        self._progress.start(10)
+        self._progress.start(PROGRESS_BAR_INTERVAL_MS)
         self._status("Imposition en cours…")
 
-        def _worker() -> None:
-            result = impose(settings)
-            self._root.after(0, lambda: self._on_done(result))
+        threading.Thread(target=self._run_worker, args=(settings,), daemon=True).start()
 
-        threading.Thread(target=_worker, daemon=True).start()
+    def _run_worker(self, settings: ImpositionSettings) -> None:
+        result = impose(settings)
+        self._root.after(0, functools.partial(self._on_done, result))
 
     def _on_done(self, result) -> None:
         self._running = False
@@ -966,7 +1019,6 @@ class MainWindow(TooltipMixin):
 
     @staticmethod
     def _open_file(path) -> None:
-        import os, sys
         try:
             if sys.platform == "win32":
                 os.startfile(str(path))

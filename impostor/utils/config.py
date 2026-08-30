@@ -74,7 +74,7 @@ class AppConfig:
                     stored = json.load(fh)
                 self._data.update(stored)
                 logger.debug("Config loaded from %s", path)
-            except Exception:
+            except (OSError, ValueError, TypeError):
                 logger.warning("Could not read config; using defaults.", exc_info=True)
 
     def save(self) -> None:
@@ -83,7 +83,7 @@ class AppConfig:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(self._data, fh, indent=2)
-        except Exception:
+        except (OSError, TypeError):
             logger.warning("Could not save config.", exc_info=True)
 
     def get(self, key: str, default: Any = None) -> Any:

@@ -15,10 +15,16 @@ Options:
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 import subprocess
 import sys
 from pathlib import Path
+
+try:
+    import tkinterdnd2
+except ImportError:
+    tkinterdnd2 = None  # type: ignore[assignment]
 
 
 APP_NAME   = "PDF Impostor"
@@ -177,12 +183,10 @@ def build(onefile: bool = False, debug: bool = False) -> None:
 
     # tkinterdnd2 ships its own Tcl extension DLL — PyInstaller needs a hint
     args += ["--hidden-import", "tkinterdnd2"]
-    try:
-        import tkinterdnd2 as _dnd
-        import os as _os
-        _dnd_dir = _os.path.dirname(_dnd.__file__)
+    if tkinterdnd2 is not None:
+        _dnd_dir = os.path.dirname(tkinterdnd2.__file__)
         args += ["--add-data", f"{_dnd_dir}{';' if sys.platform == 'win32' else ':'}."]
-    except ImportError:
+    else:
         print("  ⚠  tkinterdnd2 non trouvé – drag-and-drop désactivé dans le .exe")
 
     args.append(ENTRY_POINT)

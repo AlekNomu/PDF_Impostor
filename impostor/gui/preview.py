@@ -211,7 +211,7 @@ class ImpositionPreview(tk.Frame):
 
     def _apply_highlight(self) -> None:
         """Recolour canvas items to reflect the current highlight state."""
-        num_sigs = self._canvas.getvar("num_sigs") if False else self._last_num_sigs
+        num_sigs = self._last_num_sigs
         for s in range(num_sigs):
             tag = f"sig_{s}"
             fill = _C["highlight"] if s == self._highlighted_sig else (
@@ -239,7 +239,7 @@ class ImpositionPreview(tk.Frame):
                   f"  ·  {num_sigs * sps} feuille(s)")
         )
 
-        canvas_w, canvas_h = self._render_grid(num_pages, sps, padded, num_sigs)
+        canvas_w = self._render_grid(num_pages, sps, num_sigs)
         canvas_h = self._render_legend(num_pages, padded, canvas_w)
         self._canvas.configure(scrollregion=(0, 0, canvas_w, canvas_h))
 
@@ -261,16 +261,15 @@ class ImpositionPreview(tk.Frame):
         self,
         num_pages: int,
         sps: int,
-        padded: int,
         num_sigs: int,
-    ) -> tuple[int, int]:
+    ) -> int:
         """
         Draw all sheets in a 2-column grid (vertical scroll).
 
         Each cell = one physical sheet:  Recto (top) + Verso (below).
         Sheets fill left→right, 2 per row, then wrap to next row.
         Signatures are separated by a labelled divider line.
-        Returns (canvas_width, canvas_height_so_far).
+        Returns the canvas width; the final y offset is stored in ``self._last_y``.
         """
         z   = self._canvas_zoom
         mx  = self._sc(_MARGIN_X)
@@ -365,7 +364,7 @@ class ImpositionPreview(tk.Frame):
             y = row_top + sg
 
         self._last_y = y
-        return canvas_w, y
+        return canvas_w
 
     def _render_legend(self, num_pages: int, padded: int, canvas_w: int) -> int:
         """Draw the R/V legend in the top-right corner, and a blank-page warning

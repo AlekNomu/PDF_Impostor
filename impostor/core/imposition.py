@@ -26,6 +26,11 @@ import pypdf
 
 logger = logging.getLogger(__name__)
 
+# One printed side (= one output 2-up page): the source page index placed on the
+# right half, the one on the left half (None = blank), and the sheet's depth
+# inside its signature (0 = outermost sheet).
+_Side = tuple[Optional[int], Optional[int], int]
+
 
 class DuplexMode(Enum):
     """Printer duplex capabilities."""
@@ -106,6 +111,71 @@ def _pad_page_count(num_pages: int, sheets_per_sig: int) -> int:
     return num_pages + (multiple - remainder)
 
 
+def _iter_sides(
+    padded_pages: int,
+    sheets_per_sig: int,
+    duplex_mode: DuplexMode,
+) -> list[_Side]:
+    """
+    Build the list of printed sides, one entry per output 2-up page.
+
+    Each entry is ``(right_half, left_half, sheet_num_in_sig)``:
+      * *right_half* / *left_half* are 0-based source page indices, or None for
+        a blank page, for the two halves of the landscape sheet.
+      * *sheet_num_in_sig* is the depth of the physical sheet inside its
+        signature (0 = outermost). Both sides of a given sheet share the same
+        depth, and it restarts at 0 on each new signature — creep compensation
+        depends on it.
+
+    Sides are ordered for feeding into the printer:
+      For AUTO_DUPLEX:  [sheet0 front, sheet0 back, sheet1 front, sheet1 back, …]
+      For MANUAL modes: fronts of all sheets first, then backs (reversed within
+                        each signature when the printer does not collate).
+    """
+    num_sigs = padded_pages // (4 * sheets_per_sig)
+    all_fronts: list[_Side] = []
+    all_backs: list[_Side] = []
+
+    for sig_idx in range(num_sigs):
+        base = sig_idx * 4 * sheets_per_sig
+        order = _signature_page_order(sheets_per_sig)
+
+        sig_fronts: list[_Side] = []
+        sig_backs: list[_Side] = []
+
+        # NOTE: use default-arg capture to avoid the late-binding closure bug.
+        def idx(p: int, _base: int = base) -> Optional[int]:
+            real = _base + p
+            return real if real < padded_pages else None
+
+        for depth, (front_right, front_left, back_left, back_right) in enumerate(order):
+            # Front: right half = front_left (lo page), left half = front_right (hi page).
+            # Back:  right half = back_right (hi page), left half = back_left  (lo page).
+            sig_fronts.append((idx(front_left), idx(front_right), depth))
+            sig_backs.append((idx(back_right), idx(back_left), depth))
+
+        all_fronts.extend(sig_fronts)
+
+        if duplex_mode == DuplexMode.MANUAL_NO_COLLATE:
+            # Re-inserting the flipped stack reverses both the sheet order and
+            # the two halves of every sheet.
+            all_backs.extend(
+                (left_half, right_half, depth)
+                for right_half, left_half, depth in reversed(sig_backs)
+            )
+        else:
+            all_backs.extend(sig_backs)
+
+    if duplex_mode == DuplexMode.AUTO_DUPLEX:
+        # Interleave: each sheet's front is immediately followed by its back
+        sides: list[_Side] = []
+        for front, back in zip(all_fronts, all_backs, strict=True):
+            sides.append(front)
+            sides.append(back)
+        return sides
+    return all_fronts + all_backs
+
+
 def _build_print_sequence(
     padded_pages: int,
     sheets_per_sig: int,
@@ -115,52 +185,48 @@ def _build_print_sequence(
     Build the flat list of page indices in print order.
 
     Returns a list where each element is either a 0-based page index or None
-    (blank page). The list is ordered for feeding into the printer.
-
-    For AUTO_DUPLEX:  [front_page, back_page, front_page, back_page, ...]
-    For MANUAL modes: fronts of all sheets first, then backs (possibly reversed
-                      depending on collation).
+    (blank page). Elements come in pairs: ``sequence[i]`` is the page placed on
+    the right half of an output sheet and ``sequence[i + 1]`` the one on the
+    left half.
     """
-    num_sigs = padded_pages // (4 * sheets_per_sig)
-    all_fronts: list[Optional[int]] = []
-    all_backs: list[Optional[int]] = []
+    sequence: list[Optional[int]] = []
+    for right_half, left_half, _depth in _iter_sides(
+        padded_pages, sheets_per_sig, duplex_mode
+    ):
+        sequence.extend([right_half, left_half])
+    return sequence
 
-    for sig_idx in range(num_sigs):
-        base = sig_idx * 4 * sheets_per_sig
-        order = _signature_page_order(sheets_per_sig)
 
-        sig_fronts: list[Optional[int]] = []
-        sig_backs: list[Optional[int]] = []
+def _horizontal_translations(
+    orig_w: float,
+    sheet_num_in_sig: int,
+    inside_offset: float,
+    creep_compensation: float,
+    center_adjustment: float,
+) -> tuple[float, float]:
+    """
+    Horizontal translations for the two halves of a single 2-up sheet.
 
-        # NOTE: use default-arg capture to avoid the late-binding closure bug.
-        def idx(p: int, _base: int = base) -> Optional[int]:
-            real = _base + p
-            return real if real < padded_pages else None
+    Returns ``(right_half_tx, left_half_tx)`` — the x translation applied to the
+    page placed on the right half and on the left half of the landscape sheet.
+    The spine (fold) is the vertical middle of the sheet, at x = *orig_w*.
 
-        for front_right, front_left, back_left, back_right in order:
-            # impose() maps sequence[i] → right half, sequence[i+1] → left half.
-            # Front: left half = front_right (hi page), right half = front_left (lo page).
-            # Back:  left half = back_left   (lo page), right half = back_right  (hi page).
-            sig_fronts.extend([idx(front_left), idx(front_right)])
-            sig_backs.extend([idx(back_right), idx(back_left)])
+    Creep: once folded, sheets nested deeper in a signature protrude further at
+    the fore-edge, so they lose more paper when the booklet is trimmed flush.
+    To keep the fore-edge margin uniform, the content of inner sheets is shifted
+    *toward the spine* by an amount growing with *sheet_num_in_sig* (0 = the
+    outermost sheet). Toward the spine means moving left for the right-half page
+    and right for the left-half page.
 
-        all_fronts.extend(sig_fronts)
-
-        if duplex_mode == DuplexMode.MANUAL_NO_COLLATE:
-            # Backs must be in reverse order so re-inserting the stack works
-            all_backs.extend(reversed(sig_backs))
-        else:
-            all_backs.extend(sig_backs)
-
-    if duplex_mode == DuplexMode.AUTO_DUPLEX:
-        # Interleave front/back pairs
-        sequence: list[Optional[int]] = []
-        for i in range(0, len(all_fronts), 2):
-            sequence.extend(all_fronts[i : i + 2])
-            sequence.extend(all_backs[i : i + 2])
-        return sequence
-    else:
-        return all_fronts + all_backs
+    Inside offset: a binding margin, so it pushes both halves *away* from the
+    spine symmetrically — right for the right-half page, left for the left-half
+    page. Center adjustment shifts the whole sheet in the same direction, to
+    correct a printer that is not perfectly centred.
+    """
+    creep = creep_compensation * sheet_num_in_sig
+    right_half_tx = orig_w + inside_offset - creep + center_adjustment
+    left_half_tx = -inside_offset + creep + center_adjustment
+    return right_half_tx, left_half_tx
 
 
 def detect_page_orientations(path: Path) -> tuple[int, int, int]:
@@ -234,8 +300,8 @@ def impose(settings: ImpositionSettings) -> ImpositionResult:
         num_pages, padded, sps, num_sigs, num_sheets,
     )
 
-    #  3. Build print sequence 
-    sequence = _build_print_sequence(padded, sps, settings.duplex_mode)
+    #  3. Build print sequence
+    sides = _iter_sides(padded, sps, settings.duplex_mode)
 
     #  4. Determine page geometry
     first_page = reader.pages[0]
@@ -255,40 +321,32 @@ def impose(settings: ImpositionSettings) -> ImpositionResult:
         return reader.pages[idx]
 
     def make_blank_page() -> pypdf.PageObject:
-        page = pypdf.PageObject.create_blank_page(width=orig_w, height=orig_h)
-        return page
+        return pypdf.PageObject.create_blank_page(width=orig_w, height=orig_h)
 
-    # sequence is pairs: [left, right, left, right, ...]
-    # Each pair becomes one 2-up output page
-    for i in range(0, len(sequence), 2):
-        left_idx = sequence[i]
-        right_idx = sequence[i + 1] if i + 1 < len(sequence) else None
-
+    # Each side becomes one 2-up output page
+    for right_half_idx, left_half_idx, sheet_num_in_sig in sides:
         output_page = writer.add_blank_page(width=sheet_w, height=sheet_h)
 
-        left_page = get_page(left_idx) or make_blank_page()
-        right_page = get_page(right_idx) or make_blank_page()
+        right_half_page = get_page(right_half_idx) or make_blank_page()
+        left_half_page = get_page(left_half_idx) or make_blank_page()
         zoom = settings.zoom
 
-        # Creep compensation: inner pages get pushed outward slightly
-        sheet_num_in_sig = (i // 2) % sps
-        creep = settings.creep_compensation * sheet_num_in_sig
-
-        # Left page → placed on right half of sheet (it's the inner side when folded)
-        left_tx = orig_w + settings.inside_offset + creep + settings.center_adjustment
-        left_ty = (orig_h * (1 - zoom)) / 2
-
-        # Right page → placed on left half
-        right_tx = -creep + settings.center_adjustment
-        right_ty = (orig_h * (1 - zoom)) / 2
+        right_half_tx, left_half_tx = _horizontal_translations(
+            orig_w,
+            sheet_num_in_sig,
+            settings.inside_offset,
+            settings.creep_compensation,
+            settings.center_adjustment,
+        )
+        ty = (orig_h * (1 - zoom)) / 2
 
         output_page.merge_transformed_page(
-            right_page,
-            pypdf.Transformation().scale(zoom).translate(right_tx, right_ty),
+            left_half_page,
+            pypdf.Transformation().scale(zoom).translate(left_half_tx, ty),
         )
         output_page.merge_transformed_page(
-            left_page,
-            pypdf.Transformation().scale(zoom).translate(left_tx, left_ty),
+            right_half_page,
+            pypdf.Transformation().scale(zoom).translate(right_half_tx, ty),
         )
 
     #  6. Write output 

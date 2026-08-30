@@ -42,9 +42,9 @@ python -m pytest tests/ -v
 
 Une **signature** est un groupe de feuilles pliées ensemble pour former un cahier.
 
-| Feuilles/sig | Pages/sig | Usage typique           |
+| Feuilles/sig | Pages/sig  | Usage typique           |
 |:---:         |:---:       |---                      |
-| 0 (magazine) | toutes    | Livrets, mini-comics    |
+| 0 (magazine) | toutes     | Livrets, mini-comics    |
 | 1            | 4          | Test rapide             |
 | 4            | 16         | Revues                  |
 | 8            | 32         | Livres courants         |
